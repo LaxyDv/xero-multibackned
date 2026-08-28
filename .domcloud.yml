@@ -7,5 +7,6 @@ nginx:
     app_start_command: "uvicorn main:app --host 0.0.0.0 --port $PORT"
 
 commands:
+  - rm -rf ~/.pyenv/versions/3.14.6
   - python3 -m pip install --upgrade pip
   - python3 -m pip install -r requirements.txt
