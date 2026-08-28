@@ -1,162 +1,191 @@
 import os
-import shutil
 import uuid
-import time
-import threading
+import shutil
+import asyncio
 import yt_dlp
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
-from typing import Optional
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, BackgroundTasks
+from fastapi.responses import FileResponse
+from rembg import remove
 
 app = FastAPI(
-    title="XeroTools Secure Backend",
-    description="Auto-cleaning Multi-tool by Xeno (XQD)",
-    version="2.1-Secure"
+    title="XeroTools Core Backend",
+    description="Unified backend for Downloader, BG Remover, and Upscaler by Xeno (XQD)",
+    version="2.0-Clean"
 )
 
 # Configuration
-TEMP_ROOT = "temp_downloads"
-MAX_FILE_AGE_SECONDS = 120  # 2 Minutes
-os.makedirs(TEMP_ROOT, exist_ok=True)
+TEMP_DIR = "xero_temp"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-# --- Data Models ---
-class DownloadRequest(BaseModel):
-    url: str
-    type: str  # 'video', 'audio', 'info'
-
-# --- Security & Cleanup Logic ---
-
-def clean_old_files():
-    """Background thread that runs every 60 seconds to delete files older than 2 mins."""
-    while True:
+def cleanup(path):
+    """Safely delete temporary folders after processing."""
+    if os.path.exists(path):
         try:
-            current_time = time.time()
-            if not os.path.exists(TEMP_ROOT):
-                continue
-            
-            for folder_name in os.listdir(TEMP_ROOT):
-                folder_path = os.path.join(TEMP_ROOT, folder_name)
-                if os.path.isdir(folder_path):
-                    # Check creation time of the folder
-                    created_time = os.path.getctime(folder_path)
-                    age = current_time - created_time
-                    
-                    if age > MAX_FILE_AGE_SECONDS:
-                        print(f"[Security] Deleting old folder: {folder_name} (Age: {age:.0f}s)")
-                        shutil.rmtree(folder_path, ignore_errors=True)
+            shutil.rmtree(path)
         except Exception as e:
-            print(f"Cleanup error: {e}")
-        
-        # Sleep for 60 seconds before checking again
-        time.sleep(60)
+            print(f"Error cleaning up {path}: {e}")
 
-# Start the cleanup thread when the app launches
-cleanup_thread = threading.Thread(target=clean_old_files, daemon=True)
-cleanup_thread.start()
-
-def get_temp_folder():
-    """Creates a unique temporary folder."""
-    folder_id = str(uuid.uuid4())
-    path = os.path.join(TEMP_ROOT, folder_id)
-    os.makedirs(path, exist_ok=True)
+def get_temp_path():
+    """Create a unique temporary folder for each request."""
+    uid = str(uuid.uuid4())
+    path = os.path.join(TEMP_DIR, uid)
+    os.makedirs(path)
     return path
 
-def immediate_cleanup(folder_path: str):
-    """Deletes a specific folder immediately after use."""
-    if os.path.exists(folder_path):
-        try:
-            shutil.rmtree(folder_path)
-            print(f"[Cleanup] Removed folder: {os.path.basename(folder_path)}")
-        except Exception as e:
-            print(f"Error removing {folder_path}: {e}")
-
-# --- Download Logic ---
-
-def process_download(url: str, download_type: str, output_dir: str):
-    ydl_opts = {
-        'outtmpl': f'{output_dir}/%(title)s.%(ext)s',
-        'quiet': True,
-        'no_warnings': True,
-        'noplaylist': True,
-    }
-
-    if download_type == 'video':
-        ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        ydl_opts['merge_output_format'] = 'mp4'
-    elif download_type == 'audio':
-        ydl_opts['format'] = 'bestaudio/best'
-        ydl_opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-        ydl_opts['outtmpl'] = f'{output_dir}/%(title)s.mp3'
-    elif download_type == 'info':
-        ydl_opts['skip_download'] = True
-        ydl_opts['dump_single_json'] = True
-
+# ==========================================
+# TOOL 1: UNIVERSAL MEDIA DOWNLOADER
+# ==========================================
+@app.post("/download")
+async def download_media(url: str = Form(...), type: str = Form("video")):
+    """
+    Downloads Video or Audio from supported platforms (YT, TikTok, Insta, X, etc.)
+    type: 'video' (mp4, max 1280p) or 'audio' (mp3)
+    """
+    temp_path = get_temp_path()
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=(download_type != 'info'))
-            
-            if download_type == 'info':
-                return {"status": "success", "data": info}
+        ydl_opts = {
+            'outtmpl': f'{temp_path}/%(title)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+        }
 
-            files = os.listdir(output_dir)
+        if type == 'audio':
+            # Extract MP3
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
+        elif type == 'video':
+            # Download Video max 1280p (720p/1080p merged)
+            ydl_opts['format'] = 'bestvideo[height<=1280]+bestaudio/best[height<=1280]'
+            ydl_opts['merge_output_format'] = 'mp4'
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            files = os.listdir(temp_path)
+            
             if not files:
-                raise Exception("No file generated.")
+                raise Exception("No file generated. Link might be invalid.")
             
             filename = files[0]
-            filepath = os.path.join(output_dir, filename)
-            return {"filepath": filepath, "filename": filename}
+            filepath = os.path.join(temp_path, filename)
+            
+            # Schedule auto-delete after 2 minutes (120 seconds)
+            loop = asyncio.get_event_loop()
+            loop.call_later(120, cleanup, temp_path)
+            
+            media_type = "audio/mpeg" if type == 'audio' else "video/mp4"
+            return FileResponse(filepath, filename=filename, media_type=media_type)
 
     except Exception as e:
-        raise Exception(f"Processing failed: {str(e)}")
+        cleanup(temp_path)
+        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
-# --- API Endpoints ---
+# ==========================================
+# TOOL 2: BACKGROUND REMOVER
+# ==========================================
+@app.post("/remove-bg")
+async def remove_background(file: UploadFile = File(...)):
+    """
+    Removes background from uploaded image using AI.
+    Returns transparent PNG.
+    """
+    temp_path = get_temp_path()
+    input_filename = f"input_{file.filename}"
+    output_filename = f"nobg_{file.filename}.png"
+    
+    input_path = os.path.join(temp_path, input_filename)
+    output_path = os.path.join(temp_path, output_filename)
+    
+    try:
+        # Save uploaded file
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Process with rembg
+        with open(input_path, 'rb') as i:
+            with open(output_path, 'wb') as o:
+                input_data = i.read()
+                output_data = remove(input_data)
+                o.write(output_data)
+        
+        # Delete input immediately to save space
+        os.remove(input_path)
+        
+        # Schedule folder cleanup
+        loop = asyncio.get_event_loop()
+        loop.call_later(120, cleanup, temp_path)
+        
+        return FileResponse(output_path, filename=output_filename, media_type="image/png")
 
+    except Exception as e:
+        cleanup(temp_path)
+        raise HTTPException(status_code=500, detail=f"BG Removal failed: {str(e)}")
+
+# ==========================================
+# TOOL 3: IMAGE UPSCALER
+# ==========================================
+@app.post("/upscale")
+async def upscale_image(file: UploadFile = File(...), target_width: int = Form(1280)):
+    """
+    Upscales image to target width (default 1280px) maintaining aspect ratio.
+    Uses high-quality Lanczos resampling.
+    """
+    temp_path = get_temp_path()
+    input_filename = f"input_{file.filename}"
+    output_filename = f"upscaled_{file.filename}"
+    
+    input_path = os.path.join(temp_path, input_filename)
+    output_path = os.path.join(temp_path, output_filename)
+    
+    try:
+        # Save uploaded file
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Open and Calculate new dimensions
+        img = Image.open(input_path)
+        w_percent = (target_width / float(img.size[0]))
+        h_size = int((float(img.size[1]) * float(w_percent)))
+        
+        # Resize with High Quality (Lanczos)
+        img = img.resize((target_width, h_size), Image.Resampling.LANCZOS)
+        
+        # Convert to RGB if necessary (for JPEG compatibility)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+            
+        img.save(output_path, quality=95, optimize=True)
+        
+        # Delete input
+        os.remove(input_path)
+        
+        # Schedule folder cleanup
+        loop = asyncio.get_event_loop()
+        loop.call_later(120, cleanup, temp_path)
+        
+        return FileResponse(output_path, filename=output_filename, media_type="image/jpeg")
+
+    except Exception as e:
+        cleanup(temp_path)
+        raise HTTPException(status_code=500, detail=f"Upscaling failed: {str(e)}")
+
+# Root Endpoint
 @app.get("/")
 async def home():
     return {
-        "message": "XeroTools Secure Node Active",
-        "security_policy": "Files auto-deleted after 2 minutes",
-        "supported": ["YouTube", "TikTok", "Instagram", "X", "Facebook", "Reddit"]
+        "message": "Welcome to XeroTools Core Backend by Xeno (XQD)",
+        "tools_available": [
+            "POST /download (Video/Audio from Social Media)",
+            "POST /remove-bg (AI Background Removal)",
+            "POST /upscale (Image Enhancer to 1280p+)"
+        ],
+        "status": "Ready for Deployment"
     }
-
-@app.post("/download")
-async def download_tool(request: DownloadRequest, background_tasks: BackgroundTasks):
-    if not request.url:
-        raise HTTPException(status_code=400, detail="URL is required")
-    
-    temp_dir = get_temp_folder()
-
-    try:
-        result = process_download(request.url, request.type, temp_dir)
-
-        if request.type == 'info':
-            # For info, delete immediately after sending JSON
-            background_tasks.add_task(immediate_cleanup, temp_dir)
-            return JSONResponse(content=result)
-
-        file_path = result["filepath"]
-        file_name = result["filename"]
-        media_type = "video/mp4" if request.type == 'video' else "audio/mpeg"
-        
-        # CRITICAL: Schedule deletion IMMEDIATELY after the file response starts
-        # The background thread ensures it's gone even if the download fails halfway
-        background_tasks.add_task(immediate_cleanup, temp_dir)
-        
-        return FileResponse(
-            path=file_path,
-            filename=file_name,
-            media_type=media_type,
-            headers={"X-Auto-Delete": "true"} # Custom header to show security
-        )
-
-    except Exception as e:
-        immediate_cleanup(temp_dir)
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
